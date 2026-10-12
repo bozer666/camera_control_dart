@@ -13,6 +13,7 @@ abstract class MessageType {
   const MessageType._();
 
   static const notify = 'NOTIFY * HTTP/1.1';
+  static const mSearchResponse = 'HTTP/1.1 200 OK';
 }
 
 abstract class NotificationSubType {
@@ -25,6 +26,12 @@ abstract class NotificationSubType {
 class UpnpDiscoveryAdapter {
   static const upnpPort = 1900;
   final ipv4MulticastAddress = InternetAddress('239.255.255.250');
+  final ipv4BroadcastAddress = InternetAddress('255.255.255.255');
+
+  /// Service type used for active M-SEARCH queries. Same Canon PTP/IP
+  /// service that passive NOTIFY listening filtered for.
+  static const mSearchServiceType =
+      'urn:schemas-canon-com:service:ICPO-WFTEOSSystemService:1';
 
   final RawDatagramSocketFactory _socketFactory;
   final UpnpDeviceDescriptionParser _deviceDescriptionParser;
@@ -36,13 +43,48 @@ class UpnpDiscoveryAdapter {
         _deviceDescriptionParser =
             deviceDescriptionParser ?? const UpnpDeviceDescriptionParser();
 
+  /// Active UPnP discovery via M-SEARCH.
+  ///
+  /// The previous implementation passively listened for NOTIFY
+  /// advertisements by joining the SSDP multicast group. Joining a
+  /// multicast group on iOS requires the
+  /// com.apple.developer.networking.multicast entitlement, which Apple
+  /// must approve per app and which is unavailable to sideloaded apps,
+  /// so discovery never received anything on iOS.
+  ///
+  /// M-SEARCH instead _sends_ a query (multicast + limited broadcast)
+  /// and receives the unicast responses on an ephemeral port, which
+  /// needs no special entitlement.
   Stream<UpnpAdvertisementMessage> discover() {
     final controller = StreamController<UpnpAdvertisementMessage>();
 
     controller.onListen = () async {
-      final socket =
-          await _socketFactory.bind(InternetAddress.anyIPv4, upnpPort);
-      socket.joinMulticast(ipv4MulticastAddress);
+      // Ephemeral port: we only need the unicast M-SEARCH responses.
+      final socket = await _socketFactory.bind(InternetAddress.anyIPv4, 0);
+      Timer? searchTimer;
+
+      controller.onCancel = () {
+        searchTimer?.cancel();
+        socket.close();
+      };
+
+      Future<void> sendMSearch() async {
+        final message = 'M-SEARCH * HTTP/1.1\r\n'
+            'HOST: 239.255.255.250:1900\r\n'
+            'MAN: "ns=01"\r\n'
+            'ST: $mSearchServiceType\r\n'
+            'MX: 3\r\n'
+            '\r\n';
+        final data = utf8.encode(message);
+        // Multicast per UPnP spec, plus limited broadcast as fallback.
+        socket.send(data, ipv4MulticastAddress, upnpPort);
+        socket.send(data, ipv4BroadcastAddress, upnpPort);
+      }
+
+      // Re-query periodically so cameras appearing later are found.
+      searchTimer =
+          Timer.periodic(const Duration(seconds: 4), (_) => sendMSearch());
+      await sendMSearch();
 
       controller.addStream(
         socket.stream.transform(
@@ -65,10 +107,6 @@ class UpnpDiscoveryAdapter {
           ),
         ),
       );
-
-      controller.onCancel = () {
-        socket.close();
-      };
     };
 
     return controller.stream;
@@ -85,9 +123,12 @@ class UpnpDiscoveryAdapter {
 
     final lines = payload.split('\n');
     final messageHeader = lines.removeAt(0).toUpperCase().trim();
+    final entries = _parseEntries(lines);
+
     if (messageHeader == MessageType.notify) {
-      final entries = _parseEntries(lines);
-      return _mapToMessage(entries);
+      return _mapNotifyToMessage(entries);
+    } else if (messageHeader == MessageType.mSearchResponse) {
+      return _mapMSearchResponseToMessage(entries);
     }
 
     return null;
@@ -111,7 +152,7 @@ class UpnpDiscoveryAdapter {
     return entries;
   }
 
-  UpnpAdvertisementMessage? _mapToMessage(Map<String, String> entries) {
+  UpnpAdvertisementMessage? _mapNotifyToMessage(Map<String, String> entries) {
     try {
       final notifcationSubType = entries['NTS'];
       switch (notifcationSubType) {
@@ -136,5 +177,18 @@ class UpnpDiscoveryAdapter {
     }
 
     return null;
+  }
+
+  UpnpAdvertisementMessage? _mapMSearchResponseToMessage(
+      Map<String, String> entries) {
+    try {
+      return UpnpAdvertisementMessage.alive(
+        serviceType: entries['ST']!,
+        uniqueServiceName: entries['USN']!,
+        location: entries['LOCATION']!,
+      );
+    } catch (e) {
+      return null;
+    }
   }
 }
